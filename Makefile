@@ -12,5 +12,8 @@ all: $(EE_BIN)
 clean:
 	rm -f $(EE_BIN) $(EE_OBJS)
 
+# el mapa 3D se regenera con:  python3 tools/obj2h.py AMONGUSSKELD_3D.obj AMONGUSSKELD_3D.mtl skeld_map.h
+main.o: main.c skeld_map.h
+
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.eeglobal
