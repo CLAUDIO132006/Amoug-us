@@ -164,6 +164,7 @@ static Body bodies[6];
 static int nb, state = TITLE, done, total = 15, endwin, witness, sus, cur, opts[6], nopts, mres_t, ejected;
 static float cd, gt, camx, camz;
 static int mini = -1;                         /* sala del minijuego abierto, o -1 */
+static int tmenu, topt;                       /* menu del titulo: pantalla (0 menu, 1 skin, 2 controles) y opcion */
 static int nearTask, nearBody, pskin;   /* pskin = skin elegida por el jugador */
 static char msg[80], msg2[80];
 static u32 frames;
@@ -746,10 +747,12 @@ static int proj(float X, float Y, float Z, float *sx, float *sy, float *zc) {
 /* ---------- personaje 3D (malla de crew_model.h) ----------
    Cada personaje se dibuja como UN objeto: se proyectan sus vertices, se descartan
    las caras traseras (orientacion en pantalla), se ordenan de lejos a cerca y se pintan. */
-static float cvx[CM_NV], cvy[CM_NV], cvz[CM_NV];
-static u8 cvok[CM_NV];
-static float cfk[CM_NF];
-static u16 cfo[CM_NF];
+#define MAXV (CM_NV > CD_NV ? CM_NV : CD_NV)
+#define MAXF (CM_NF > CD_NF ? CM_NF : CD_NF)
+static float cvx[MAXV], cvy[MAXV], cvz[MAXV];
+static u8 cvok[MAXV];
+static float cfk[MAXF];
+static u16 cfo[MAXF];
 static int cmp_cf(const void *a, const void *b) {
   float d = cfk[*(const u16 *)b] - cfk[*(const u16 *)a];
   return d > 0 ? 1 : (d < 0 ? -1 : 0);
@@ -758,18 +761,22 @@ static int cmp_cf(const void *a, const void *b) {
 #define LX .30f
 #define LY .80f
 #define LZ .52f
-/* lay=1: acostado de lado (cuerpo sin vida) */
-static void draw_crew(float wx, float wz, float yaw, int lay, int skin) {
+/* dead=1: cuerpo sin vida = mitad inferior cortada, con el hueso saliendo (malla CD_*) */
+static void draw_crew(float wx, float wz, float yaw, int dead, int skin) {
+  const float (*V)[3] = dead ? CD_V : CM_V;
+  const u16 (*F)[4] = dead ? CD_F : CM_F;
+  const u8 *K = dead ? CD_K : CM_K;
+  const signed char (*N)[3] = dead ? CD_N : CM_N;
+  int nv = dead ? CD_NV : CM_NV, nf = dead ? CD_NF : CM_NF;
   float cy = cosf(yaw), sy = sinf(yaw), zc;
-  for (int v = 0; v < CM_NV; v++) {
-    float px = CM_V[v][0], py = CM_V[v][1], pz = CM_V[v][2];
-    if (lay) { float t = px; px = -py; py = t + CM_HALFW; }
+  for (int v = 0; v < nv; v++) {
+    float px = V[v][0], py = V[v][1], pz = V[v][2];
     cvok[v] = proj(wx + px * cy + pz * sy, py, wz - px * sy + pz * cy, &cvx[v], &cvy[v], &zc);
     cvz[v] = zc;
   }
   int n = 0;
-  for (int f = 0; f < CM_NF; f++) {
-    int a = CM_F[f][0], b = CM_F[f][1], c = CM_F[f][2], d = CM_F[f][3];
+  for (int f = 0; f < nf; f++) {
+    int a = F[f][0], b = F[f][1], c = F[f][2], d = F[f][3];
     if (!(cvok[a] & cvok[b] & cvok[c] & cvok[d])) continue;
     float cr = (cvx[b] - cvx[a]) * (cvy[c] - cvy[a]) - (cvy[b] - cvy[a]) * (cvx[c] - cvx[a]);
     if (cr CM_CULL 0) continue;                                   /* cara trasera */
@@ -777,14 +784,13 @@ static void draw_crew(float wx, float wz, float yaw, int lay, int skin) {
   }
   qsort(cfo, n, sizeof(u16), cmp_cf);
   for (int i = 0; i < n; i++) {
-    int f = cfo[i], a = CM_F[f][0], b = CM_F[f][1], c = CM_F[f][2], d = CM_F[f][3];
-    float nx = CM_N[f][0] / 127.f, ny = CM_N[f][1] / 127.f, nz = CM_N[f][2] / 127.f;
-    if (lay) { float t = nx; nx = -ny; ny = t; }
+    int f = cfo[i], a = F[f][0], b = F[f][1], c = F[f][2], d = F[f][3];
+    float nx = N[f][0] / 127.f, ny = N[f][1] / 127.f, nz = N[f][2] / 127.f;
     float wnx = nx * cy + nz * sy, wnz = -nx * sy + nz * cy;
     float dl = wnx * LX + ny * LY + wnz * LZ; if (dl < 0) dl = 0;
-    int k = CM_K[f];
-    float sh = k == 3 ? .70f + .30f * dl : .42f + .58f * dl;
-    const u8 *rgb = k == 0 ? CM_SKIN_RGB[skin] : CM_KIND_RGB[k];
+    int k = K[f];
+    float sh = k == 3 ? .70f + .30f * dl : (k == 4 ? .60f + .40f * dl : (k == 5 ? .50f : .42f + .58f * dl));
+    const u8 *rgb = (k == 0 || k == 5) ? CM_SKIN_RGB[skin] : CM_KIND_RGB[k];
     int r = (int)(rgb[0] * sh), g = (int)(rgb[1] * sh), bl = (int)(rgb[2] * sh);
     if (r > 255) r = 255; if (g > 255) g = 255; if (bl > 255) bl = 255;
     gsKit_prim_quad(gs, cvx[a], cvy[a], cvx[b], cvy[b], cvx[d], cvy[d], cvx[c], cvy[c], 1, C(r, g, bl));
@@ -888,23 +894,48 @@ static void draw_world(float tx, float tz, float cull, int chars) {
   if (chars && ch[0].alive) draw_char(0);
 }
 
+static void ctext(float y, int sc, u64 col, const char *t) {      /* texto centrado en pantalla */
+  text((SW - (int)strlen(t) * 4 * sc + sc) / 2, y, sc, col, t);
+}
+
 static void draw(void) {
   gsKit_clear(gs, C(2,6,23));
   if (state == TITLE) {
+    u64 bg = C(2,6,23), yel = C(255,210,58), wht = C(230,240,255);
     set_view(0, 0, 0, gt * .25f, .8f, 70.f);                 /* camara orbitando el mapa */
     draw_world(0, 0, 80.f, 0);
-    rect(90, 36, SW - 90, 150, C(2,6,23)); rect(120, 156, SW - 120, 186, C(2,6,23));
-    text(110, 52, 8, C(150,190,255), "SOSPECHOSO");
-    text(150, 164, 3, C(230,240,255), "ESTILO PS2 - HOMEBREW");
-    rect(150, 322, SW - 150, 392, C(2,6,23));
-    { char b[40]; snprintf(b, sizeof b, "< %s >", CM_SKIN_NAME[pskin]);
-      rect(SW / 2 - 10, 326, SW / 2 + 10, 336, C(CM_SKIN_RGB[pskin][0], CM_SKIN_RGB[pskin][1], CM_SKIN_RGB[pskin][2]));
-      text((SW - strlen(b) * 12) / 2, 340, 3, C(230,240,255), b); }
-    if (((int)(gt * 2)) & 1) text((SW - 11 * 12) / 2, 364, 3, C(255,210,58), "PULSA START");
-    set_view(0, 1.3f, 0, 0, .2f, 7.5f);                      /* primer plano de la skin elegida */
-    draw_crew(0, 0, gt * 1.2f, 0, pskin);
-    rect(40, 402, SW - 40, 428, C(2,6,23));
-    text(60, 408, 2, C(160,190,255), "IZQ-DER SKIN  X USAR  O REPORTAR");
+    const u8 *sk = CM_SKIN_RGB[pskin];
+    if (tmenu == 0) {                                         /* ---- menu principal ---- */
+      static const char *opt[3] = {"SKIN", "JUGAR", "CONTROLES"};
+      rect(100, 30, SW - 100, 112, bg); ctext(52, 8, C(150,190,255), "SOSPECHOSO");
+      rect(150, 118, SW - 150, 148, bg); ctext(125, 3, wht, "ESTILO PS2 - HOMEBREW");
+      for (int i = 0; i < 3; i++) {
+        float y = 176 + i * 52;
+        rect(170, y, SW - 170, y + 42, i == topt ? yel : C(40,70,170));
+        ctext(y + 14, 3, i == topt ? C(30,20,0) : C(255,255,255), opt[i]);
+      }
+      rect(SW - 170 - 44, 176 + 8, SW - 170 - 12, 176 + 34, C(sk[0], sk[1], sk[2]));   /* muestra de tu skin */
+      rect(40, 402, SW - 40, 428, bg); ctext(408, 2, C(160,190,255), "ARRIBA-ABAJO ELEGIR  X ACEPTAR  START JUGAR");
+    } else if (tmenu == 1) {                                  /* ---- skin ---- */
+      rect(100, 24, SW - 100, 88, bg); ctext(40, 5, C(150,190,255), "ELIGE TU SKIN");
+      rect(190, 96, SW - 190, 300, bg);
+      set_view(0, .65f, 0, 0, .2f, 6.5f);
+      draw_crew(0, 0, gt * 1.2f, 0, pskin);
+      { char b[40]; snprintf(b, sizeof b, "< %s >", CM_SKIN_NAME[pskin]);
+        rect(170, 306, SW - 170, 340, bg); ctext(314, 3, wht, b); }
+      { float x0 = (SW - CM_NSKIN * 40 + 12) / 2.f;
+        for (int i = 0; i < CM_NSKIN; i++) {
+          const u8 *c = CM_SKIN_RGB[i]; float x = x0 + i * 40;
+          if (i == pskin) rect(x - 4, 346, x + 32, 376, yel); else rect(x - 2, 348, x + 30, 374, bg);
+          rect(x, 350, x + 28, 372, C(c[0], c[1], c[2]));
+        } }
+      rect(40, 402, SW - 40, 428, bg); ctext(408, 2, C(160,190,255), "IZQ-DER CAMBIAR  X ACEPTAR");
+    } else {                                                  /* ---- controles ---- */
+      static const char *ln[5] = {"D-PAD O STICK  MOVER", "X  USAR TAREA O VOTAR", "O  REPORTAR CUERPO", "O  SALIR DE UNA TAREA", "START  JUGAR"};
+      rect(90, 40, SW - 90, 390, bg); ctext(56, 5, C(150,190,255), "CONTROLES");
+      for (int i = 0; i < 5; i++) text(130, 140 + i * 40, 2, i % 2 ? wht : C(190,215,255), ln[i]);
+      rect(40, 402, SW - 40, 428, bg); ctext(408, 2, C(160,190,255), "X VOLVER");
+    }
     return;
   }
   Ch *p = &ch[0];
@@ -982,9 +1013,16 @@ int main(void) {
     switch (state) {
       case TITLE:
         gt += DT;
-        if (pressed & PAD_RIGHT) pskin = (pskin + 1) % CM_NSKIN;
-        if (pressed & PAD_LEFT) pskin = (pskin + CM_NSKIN - 1) % CM_NSKIN;
-        if (pressed & PAD_START) start();
+        if (pressed & PAD_START) { tmenu = 0; start(); break; }
+        if (tmenu == 0) {
+          if (mpress & PAD_UP) topt = (topt + 2) % 3;
+          if (mpress & PAD_DOWN) topt = (topt + 1) % 3;
+          if (mpress & PAD_CROSS) { if (topt == 0) tmenu = 1; else if (topt == 1) start(); else tmenu = 2; }
+        } else if (tmenu == 1) {
+          if (mpress & PAD_RIGHT) pskin = (pskin + 1) % CM_NSKIN;
+          if (mpress & PAD_LEFT) pskin = (pskin + CM_NSKIN - 1) % CM_NSKIN;
+          if (mpress & (PAD_CROSS | PAD_CIRCLE)) tmenu = 0;
+        } else if (mpress & (PAD_CROSS | PAD_CIRCLE)) tmenu = 0;
         break;
       case PLAY: update(); break;
       case MEET:
