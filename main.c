@@ -16,6 +16,12 @@
 
 #include "skeld_map.h"   /* geometria 3D, pisos, colisiones y salas (generado por tools/obj2h.py) */
 #include "crew_model.h"   /* tripulante 3D + 7 skins (generado por tools/fbx2h.py) */
+#ifdef USE_AUDIO          /* sonido de pasos: make AUDIO=1 (por defecto) | make AUDIO=0 para compilar sin audio */
+#include <audsrv.h>
+#include "sfx_step.h"     /* clips de pasos (generado por tools/audio2h.py) */
+extern unsigned char audsrv_irx[];
+extern unsigned int size_audsrv_irx;
+#endif
 
 #define C(r,g,b) GS_SETREG_RGBAQ(r,g,b,0x80,0x00)
 #define DT (1.0f/60.0f)
@@ -154,16 +160,20 @@ static int find_path(float sx, float sz, float tx, float tz, u16 *out) {
 /* ---------- estado ---------- */
 typedef struct {
   float x, y, wait, rt, yaw, tyaw;      /* y = coordenada z del mundo; yaw = hacia donde mira */
+  float ph, run, ox, oz;                /* animacion de correr: fase, mezcla 0..1, posicion del cuadro anterior */
+  int lstep;
   int skin, alive, imp, goal, cur, rl, ri, tn[3], td[3];
   u16 route[MAXP];
 } Ch;
 typedef struct { float x, y, yaw; int i; } Body;
-enum { TITLE, PLAY, MEET, MRES, END };
+enum { TITLE, INTRO, PLAY, MEET, MRES, END };
 static Ch ch[6];
 static Body bodies[6];
 static int nb, state = TITLE, done, total = 15, endwin, witness, sus, cur, opts[6], nopts, mres_t, ejected;
 static float cd, gt, camx, camz;
 static int mini = -1;                         /* sala del minijuego abierto, o -1 */
+static int prole, witP, nearKill;             /* prole: rol elegido (0 azar, 1 tripulante, 2 impostor); witP: te vieron matar */
+static float intro_t;                         /* tiempo de la animacion de entrada */
 static int tmenu, topt;                       /* menu del titulo: pantalla (0 menu, 1 skin, 2 controles) y opcion */
 static int nearTask, nearBody, pskin;   /* pskin = skin elegida por el jugador */
 static char msg[80], msg2[80];
@@ -179,9 +189,49 @@ static void turn(Ch *c) {                     /* gira suavemente hacia tyaw */
   float k = DT * 14; c->yaw += d * (k > 1 ? 1 : k);
 }
 
+/* ---------- correr: animacion + sonido de pasos ----------
+   Como en Among Us la cadencia es fija: ~4 pasos por segundo (igual que la grabacion), un pie toca el suelo
+   cada media vuelta de fase (ph = pi/2 + k*pi) y en ese instante suena un clip de paso.                      */
+#define STEP_RATE 3.99f
+#ifdef USE_AUDIO
+static int audio_ok;
+static void audio_init(void) {
+  int ret = 0;
+  SifLoadModule("rom0:LIBSD", 0, NULL);                              /* audsrv necesita libsd (esta en la BIOS) */
+  SifExecModuleBuffer(audsrv_irx, size_audsrv_irx, 0, NULL, &ret);   /* audsrv.irx va incrustado en el ELF */
+  if (audsrv_init() != 0) return;
+  struct audsrv_fmt_t fmt; fmt.freq = SFX_RATE; fmt.bits = 16; fmt.channels = 1;
+  if (audsrv_set_format(&fmt) != 0) return;
+  audio_ok = 1;
+}
+static void sfx_step(void) {
+  static u32 rs = 12345; static int last = -1;                       /* azar propio: no altera el de la partida */
+  if (!audio_ok) return;
+  rs = rs * 1664525u + 1013904223u;
+  int k = (int)((rs >> 16) % SFX_NSTEP); if (k == last) k = (k + 1) % SFX_NSTEP; last = k;
+  audsrv_play_audio((const char *)(SFX_PCM + k * SFX_LEN), SFX_LEN * 2);
+}
+#else
+static void audio_init(void) {}
+static void sfx_step(void) {}
+#endif
+static void anim(Ch *c, int snd) {                /* snd=1: este personaje hace sonar sus pasos (el jugador) */
+  float spd = hypotf(c->x - c->ox, c->y - c->oz) / DT;
+  int moving = c->alive && spd > 1.0f;            /* si choca con una pared no "corre" */
+  if (moving && c->run < .05f) { c->ph = 1.07f; c->lstep = -1; }   /* arranque: el primer pie toca en ~40 ms */
+  float k = DT * 14; if (k > 1) k = 1;
+  c->run += ((moving ? 1.f : 0.f) - c->run) * k;
+  if (!moving) return;
+  c->ph += DT * STEP_RATE * 3.14159f;
+  int st = (int)floorf((c->ph - 1.5708f) / 3.14159f);
+  if (st != c->lstep) { c->lstep = st; if (snd) sfx_step(); }
+  if (c->ph > 628.f) { c->ph -= 628.318f; c->lstep -= 200; }      /* evita perder precision */
+}
+
 static void start(void) {
   srand(frames);
-  int imp = 1 + rand() % 5;
+  int pimp = (prole == 2) || (prole == 0 && rand() % 6 == 0);   /* 1 impostor entre 6: igual de probable para ti que para cualquiera */
+  int imp = pimp ? 0 : 1 + rand() % 5;
   float cx = (SK_ROOM[CAFE][0] + SK_ROOM[CAFE][2]) / 2, cz = (SK_ROOM[CAFE][1] + SK_ROOM[CAFE][3]) / 2;
   for (int i = 0; i < 6; i++) {
     Ch *c = &ch[i]; memset(c, 0, sizeof(Ch));
@@ -198,7 +248,7 @@ static void start(void) {
     for (int k = nr - 1; k > 0; k--) { int j = rand() % (k + 1), t = rest[k]; rest[k] = rest[j]; rest[j] = t; }
     ch[0].skin = pskin; for (int i = 1; i < 6; i++) ch[i].skin = rest[i - 1];
   }
-  nb = 0; done = 0; cd = 20; mini = -1; witness = -1; gt = 0; state = PLAY;
+  nb = 0; done = 0; cd = 20; mini = -1; witness = -1; witP = 0; gt = 0; state = INTRO; intro_t = 0;
   camx = ch[0].x; camz = ch[0].y;
 }
 static void finish(int win, const char *m) {
@@ -206,8 +256,9 @@ static void finish(int win, const char *m) {
   endwin = win; state = END;
   snprintf(msg, sizeof msg, "%s", m);
   int im = 0; for (int i = 0; i < 6; i++) if (ch[i].imp) im = i;
-  snprintf(msg2, sizeof msg2, "EL IMPOSTOR ERA %s", nm_of(im));
+  if (im == 0) snprintf(msg2, sizeof msg2, "ERAS EL IMPOSTOR"); else snprintf(msg2, sizeof msg2, "EL IMPOSTOR ERA %s", nm_of(im));
 }
+static void finish_team(int crew_wins, const char *m) { finish(ch[0].imp ? !crew_wins : crew_wins, m); }   /* el "ganas" depende de tu rol */
 static float steer(Ch *c, float tx, float tz, float sp) {
   float dx = tx - c->x, dz = tz - c->y, d = hypotf(dx, dz);
   if (d < .01f) return 0;
@@ -236,6 +287,10 @@ static void kill(Ch *k, Ch *t) {
   t->alive = 0; bodies[nb].x = t->x; bodies[nb].y = t->y; bodies[nb].i = (int)(t - ch); bodies[nb].yaw = t->yaw; nb++;
   cd = 18; k->wait = 1.2f; k->goal = -1; k->cur = -1; k->rl = k->ri = 0;
   if (t == &ch[0]) { char b[80]; snprintf(b, sizeof b, "%s TE ELIMINO", nm_of(k - ch)); finish(0, b); }
+  else if (k == &ch[0]) {                      /* mataste tu: si algun tripulante te vio, sospechara de ti en la reunion */
+    for (int i = 1; i < 6; i++)
+      if (ch[i].alive && ch + i != t && hypotf(k->x - ch[i].x, k->y - ch[i].y) < 9.f && same_area(k->x, k->y, ch[i].x, ch[i].y)) witP = 1;
+  }
   else if (ch[0].alive && hypotf(k->x - ch[0].x, k->y - ch[0].y) < 9.f && same_area(k->x, k->y, ch[0].x, ch[0].y)) witness = k - ch;
 }
 static void ai(Ch *c) {
@@ -273,9 +328,11 @@ static void meeting(int by, int victim) {
   nb = 0; state = MEET; cur = 0; mini = -1; (void)by;
   int imp = 0, oth[5], no = 0;
   for (int i = 0; i < 6; i++) { if (ch[i].imp) imp = i; else if (i && ch[i].alive) oth[no++] = i; }
-  sus = (frand() < .65f || !no) ? imp : oth[rand() % no];
+  if (ch[0].imp) sus = (witP || !no) ? 0 : oth[rand() % no];          /* si eres el impostor: sospechan de ti solo si te vieron */
+  else sus = (frand() < .65f || !no) ? imp : oth[rand() % no];
   snprintf(msg, sizeof msg, "%s REPORTO A %s", nm_of(by), nm_of(victim));
-  if (witness >= 0) snprintf(msg2, sizeof msg2, "VISTE A %s ELIMINARLO", nm_of(witness));
+  if (ch[0].imp) snprintf(msg2, sizeof msg2, witP ? "ALGUIEN TE VIO CERCA DEL CUERPO" : "NADIE SABE QUIEN FUE");
+  else if (witness >= 0) snprintf(msg2, sizeof msg2, "VISTE A %s ELIMINARLO", nm_of(witness));
   else snprintf(msg2, sizeof msg2, "VIERON A %s CERCA DEL CUERPO", nm_of(sus));
   nopts = 0; for (int i = 1; i < 6; i++) if (ch[i].alive) opts[nopts++] = i;
   opts[nopts++] = -1;
@@ -300,17 +357,17 @@ static void vote(int id) {
 }
 static void after_vote(void) {
   if (ejected >= 0) ch[ejected].alive = 0;
-  if (ejected >= 0 && ch[ejected].imp) { finish(1, "EXPULSASTE AL IMPOSTOR"); return; }
+  if (ejected >= 0 && ch[ejected].imp) { finish_team(1, ch[0].imp ? "TE DESCUBRIERON" : "EXPULSASTE AL IMPOSTOR"); return; }
   if (ejected == 0) { finish(0, "TE EXPULSARON"); return; }
   int crew = 0; for (int i = 0; i < 6; i++) if (ch[i].alive && !ch[i].imp) crew++;
-  if (crew <= 1) { finish(0, "GANO EL IMPOSTOR"); return; }
+  if (crew <= 1) { finish_team(0, "GANO EL IMPOSTOR"); return; }
   float cx = (SK_ROOM[CAFE][0] + SK_ROOM[CAFE][2]) / 2, cz = (SK_ROOM[CAFE][1] + SK_ROOM[CAFE][3]) / 2;
   int k = 0;
   for (int i = 0; i < 6; i++) if (ch[i].alive) {
     ch[i].x = cx + cosf(k * 1.2f) * 2.4f; ch[i].y = cz + sinf(k * 1.2f) * 1.8f; find_free(&ch[i].x, &ch[i].y);
-    ch[i].yaw = ch[i].tyaw = 3.14159f; ch[i].goal = -1; ch[i].ri = ch[i].rl = 0; ch[i].wait = frand() * 2; k++;
+    ch[i].yaw = ch[i].tyaw = 3.14159f; ch[i].run = 0; ch[i].goal = -1; ch[i].ri = ch[i].rl = 0; ch[i].wait = frand() * 2; k++;
   }
-  cd = 15; witness = -1; state = PLAY;
+  cd = 15; witness = -1; witP = 0; state = PLAY;
   camx = ch[0].x; camz = ch[0].y;
 }
 
@@ -695,7 +752,8 @@ static void mini_draw(void) {
 
 
 static void update(void) {
-  Ch *p = &ch[0]; gt += DT; cd -= DT; nearTask = -1; nearBody = -1;
+  Ch *p = &ch[0]; gt += DT; cd -= DT; nearTask = -1; nearBody = -1; nearKill = -1;
+  for (int i = 0; i < 6; i++) { ch[i].ox = ch[i].x; ch[i].oz = ch[i].y; }
   if (p->alive && mini >= 0) mini_update();             /* jugando: el mundo sigue, tu personaje no se mueve */
   else if (p->alive) {
     float mx = ax + ((btns & PAD_RIGHT) ? 1 : 0) - ((btns & PAD_LEFT) ? 1 : 0);
@@ -704,22 +762,29 @@ static void update(void) {
     float nx = p->x + mx * PSPD * DT, ny = p->y + my * PSPD * DT;
     if (walk(nx, p->y)) p->x = nx; if (walk(p->x, ny)) p->y = ny;
     if (m > .1f) p->tyaw = atan2f(-mx, -my);
-    for (int k = 0; k < 3; k++)
-      if (!p->td[k] && hypotf(p->x - SK_STN[p->tn[k]][0], p->y - SK_STN[p->tn[k]][1]) < 1.8f) nearTask = k;
-    if (nearTask >= 0 && (pressed & PAD_CROSS)) mini_open(nearTask);
+    if (!p->imp) {
+      for (int k = 0; k < 3; k++)
+        if (!p->td[k] && hypotf(p->x - SK_STN[p->tn[k]][0], p->y - SK_STN[p->tn[k]][1]) < 1.8f) nearTask = k;
+      if (nearTask >= 0 && (pressed & PAD_CROSS)) mini_open(nearTask);
+    } else {                                              /* impostor: sin tareas; X mata al tripulante mas cercano */
+      float bd = 1.9f;
+      for (int i = 1; i < 6; i++)
+        if (ch[i].alive && !ch[i].imp) { float d = hypotf(p->x - ch[i].x, p->y - ch[i].y); if (d < bd) { bd = d; nearKill = i; } }
+      if (nearKill >= 0 && cd <= 0 && (pressed & PAD_CROSS)) kill(p, &ch[nearKill]);
+    }
     for (int i = 0; i < nb; i++) if (hypotf(p->x - bodies[i].x, p->y - bodies[i].y) < 3.2f) nearBody = i;
     if ((pressed & PAD_CIRCLE) && nearBody >= 0) { meeting(0, bodies[nearBody].i); return; }
   }
   for (int i = 1; i < 6; i++) if (ch[i].alive) ai(&ch[i]);
-  for (int i = 0; i < 6; i++) if (ch[i].alive) turn(&ch[i]);
+  for (int i = 0; i < 6; i++) if (ch[i].alive) { turn(&ch[i]); anim(&ch[i], i == 0); }
   if (state != PLAY) return;
   for (int i = 1; i < 6; i++)
     if (ch[i].alive && !ch[i].imp)
       for (int b = 0; b < nb; b++)
         if (state == PLAY && hypotf(ch[i].x - bodies[b].x, ch[i].y - bodies[b].y) < 5.5f && frand() < DT * 1.2f) { meeting(i, bodies[b].i); return; }
   int crew = 0; for (int i = 0; i < 6; i++) if (ch[i].alive && !ch[i].imp) crew++;
-  if (done >= total) finish(1, "TAREAS COMPLETADAS");
-  else if (crew <= 1) finish(0, "GANO EL IMPOSTOR");
+  if (done >= total) finish_team(1, "TAREAS COMPLETADAS");
+  else if (crew <= 1) finish_team(0, "GANO EL IMPOSTOR");
 }
 
 /* ---------- camara 3D y proyeccion ---------- */
@@ -747,6 +812,53 @@ static int proj(float X, float Y, float Z, float *sx, float *sy, float *zc) {
 /* ---------- personaje 3D (malla de crew_model.h) ----------
    Cada personaje se dibuja como UN objeto: se proyectan sus vertices, se descartan
    las caras traseras (orientacion en pantalla), se ordenan de lejos a cerca y se pintan. */
+/* ---------- niebla de vision ----------
+   Solo ves lo que tienes a la vista: se lanzan rayos desde tu personaje y las paredes los cortan.
+   Lo que queda fuera (otros cuartos, personajes, cuerpos) no se dibuja, asi no ves quien mata a quien. */
+#define VIS_R 9.5f
+static u8 los[SK_GH][SK_GW];                  /* 1 = hay piso (la vista pasa), 0 = vacio/pared (la vista se corta) */
+static u16 vseen[SK_GH][SK_GW], vgen;         /* celdas vistas en este cuadro */
+static float vdx[180], vdz[180];
+static int fog_on;
+static float fogx, fogz;
+static float char_lit = 1.f;                  /* oscurece personajes lejanos (lo usa draw_crew) */
+static void vis_init(void) {
+  for (int j = 0; j < SK_GH; j++)
+    for (int i = 0; i < SK_GW; i++) {
+      float x = SK_GX0 + (i + .5f) * SK_CELL, z = SK_GZ0 + (j + .5f) * SK_CELL; u8 in = 0;
+      for (int f = 0; f < SK_NFLOOR; f++)
+        if (x >= SK_FL[f][0] && x <= SK_FL[f][2] && z >= SK_FL[f][1] && z <= SK_FL[f][3]) { in = 1; break; }
+      los[j][i] = in;
+    }
+  for (int k = 0; k < 180; k++) { vdx[k] = cosf(k * 0.034907f); vdz[k] = sinf(k * 0.034907f); }   /* un rayo cada 2 grados */
+}
+static void vis_update(float px, float pz) {
+  fogx = px; fogz = pz;
+  if (++vgen == 0) { memset(vseen, 0, sizeof vseen); vgen = 1; }
+  for (int k = 0; k < 180; k++)
+    for (float d = 0; d <= VIS_R; d += .35f) {
+      int i = (int)floorf((px + vdx[k] * d - SK_GX0) / SK_CELL), j = (int)floorf((pz + vdz[k] * d - SK_GZ0) / SK_CELL);
+      if (i < 0 || j < 0 || i >= SK_GW || j >= SK_GH) break;
+      vseen[j][i] = vgen;
+      if (!los[j][i]) break;                  /* pared: el rayo se detiene (la pared misma si se ve) */
+    }
+}
+static int vis_cell(int i, int j) { return i >= 0 && j >= 0 && i < SK_GW && j < SK_GH && vseen[j][i] == vgen; }
+static int vis_at(float x, float z) {         /* este punto esta a la vista? */
+  if (!fog_on || hypotf(x - fogx, z - fogz) < 1.3f) return 1;
+  return vis_cell((int)floorf((x - SK_GX0) / SK_CELL), (int)floorf((z - SK_GZ0) / SK_CELL));
+}
+static int vis_near(float x, float z) {       /* idem, tolerando 1 celda de margen (para paredes y baldosas) */
+  int i = (int)floorf((x - SK_GX0) / SK_CELL), j = (int)floorf((z - SK_GZ0) / SK_CELL);
+  for (int dj = -1; dj <= 1; dj++) for (int di = -1; di <= 1; di++) if (vis_cell(i + di, j + dj)) return 1;
+  return 0;
+}
+static float fogk(float x, float z) {         /* 1 cerca de ti, se oscurece hacia el borde de tu vision */
+  if (!fog_on) return 1.f;
+  float k = (VIS_R - hypotf(x - fogx, z - fogz)) / (VIS_R * .45f);
+  return k < .18f ? .18f : (k > 1.f ? 1.f : k);
+}
+
 #define MAXV (CM_NV > CD_NV ? CM_NV : CD_NV)
 #define MAXF (CM_NF > CD_NF ? CM_NF : CD_NF)
 static float cvx[MAXV], cvy[MAXV], cvz[MAXV];
@@ -757,20 +869,40 @@ static int cmp_cf(const void *a, const void *b) {
   float d = cfk[*(const u16 *)b] - cfk[*(const u16 *)a];
   return d > 0 ? 1 : (d < 0 ? -1 : 0);
 }
+#define RUN_LEGH  .42f   /* altura (m) hasta donde llegan las piernas */
+#define RUN_SWING .22f   /* cuanto avanzan/retroceden los pies (m) */
+#define RUN_LIFT  .12f   /* cuanto se levanta el pie (m) */
 #define CM_CULL >   /* una cara es visible si su area en pantalla es negativa (y hacia abajo) */
 #define LX .30f
 #define LY .80f
 #define LZ .52f
 /* dead=1: cuerpo sin vida = mitad inferior cortada, con el hueso saliendo (malla CD_*) */
-static void draw_crew(float wx, float wz, float yaw, int dead, int skin) {
+static void draw_crew(float wx, float wz, float yaw, int dead, int skin, float ph, float run) {
   const float (*V)[3] = dead ? CD_V : CM_V;
   const u16 (*F)[4] = dead ? CD_F : CM_F;
   const u8 *K = dead ? CD_K : CM_K;
   const signed char (*N)[3] = dead ? CD_N : CM_N;
   int nv = dead ? CD_NV : CM_NV, nf = dead ? CD_NF : CM_NF;
   float cy = cosf(yaw), sy = sinf(yaw), zc;
+  /* animacion de correr (solo vivo): piernas alternadas (balanceo + levantar), rebote, inclinacion y balanceo del cuerpo */
+  float rk = dead ? 0.f : run, s = 0, c = 1, cl = 1, sl = 0, cr = 1, sr = 0, bob = 0;
+  if (rk > .01f) {
+    s = sinf(ph); c = cosf(ph);
+    float lean = .13f * rk, roll = .10f * s * rk;
+    cl = cosf(lean); sl = sinf(lean); cr = cosf(roll); sr = sinf(roll); bob = fabsf(c) * .07f * rk;
+  }
   for (int v = 0; v < nv; v++) {
     float px = V[v][0], py = V[v][1], pz = V[v][2];
+    if (rk > .01f) {
+      float w = 1.f - py / RUN_LEGH;                                     /* 1 en los pies, 0 en la entrepierna */
+      if (w > 0) {
+        float side = px / .12f; side = side < -1 ? -1 : (side > 1 ? 1 : side);   /* -1 pierna izquierda, +1 derecha */
+        pz += RUN_SWING * side * s * w * rk;                                /* adelante/atras (el frente es -Z) */
+        float lift = -side * c; if (lift > 0) py += RUN_LIFT * lift * w * rk;    /* levanta el pie al avanzar */
+      }
+      float z2 = pz * cl - py * sl, y2 = py * cl + pz * sl; pz = z2; py = y2;    /* inclinacion hacia adelante */
+      float x2 = px * cr - py * sr; y2 = px * sr + py * cr; px = x2; py = y2 + bob;   /* balanceo lateral + rebote */
+    }
     cvok[v] = proj(wx + px * cy + pz * sy, py, wz - px * sy + pz * cy, &cvx[v], &cvy[v], &zc);
     cvz[v] = zc;
   }
@@ -778,6 +910,7 @@ static void draw_crew(float wx, float wz, float yaw, int dead, int skin) {
   for (int f = 0; f < nf; f++) {
     int a = F[f][0], b = F[f][1], c = F[f][2], d = F[f][3];
     if (!(cvok[a] & cvok[b] & cvok[c] & cvok[d])) continue;
+    if ((K[f] == 3 || K[f] == 2) && N[f][2] > 10) continue;       /* caras traseras del visor: van por dentro del cuerpo, nunca se ven */
     float cr = (cvx[b] - cvx[a]) * (cvy[c] - cvy[a]) - (cvy[b] - cvy[a]) * (cvx[c] - cvx[a]);
     if (cr CM_CULL 0) continue;                                   /* cara trasera */
     cfk[n] = (cvz[a] + cvz[b] + cvz[c] + cvz[d]) * .25f; cfo[n++] = f;
@@ -790,6 +923,7 @@ static void draw_crew(float wx, float wz, float yaw, int dead, int skin) {
     float dl = wnx * LX + ny * LY + wnz * LZ; if (dl < 0) dl = 0;
     int k = K[f];
     float sh = k == 3 ? .70f + .30f * dl : (k == 4 ? .60f + .40f * dl : (k == 5 ? .50f : .42f + .58f * dl));
+    sh *= char_lit;
     const u8 *rgb = (k == 0 || k == 5) ? CM_SKIN_RGB[skin] : CM_KIND_RGB[k];
     int r = (int)(rgb[0] * sh), g = (int)(rgb[1] * sh), bl = (int)(rgb[2] * sh);
     if (r > 255) r = 255; if (g > 255) g = 255; if (bl > 255) bl = 255;
@@ -806,14 +940,16 @@ static int on_screen(float x, float z, float *sx, float *sy) {
 static void draw_char(int i) {
   Ch *c = &ch[i]; float x, y, z;
   if (!on_screen(c->x, c->y, &x, &y)) return;
-  draw_crew(c->x, c->y, c->yaw, 0, c->skin);
+  char_lit = i ? fogk(c->x, c->y) : 1.f;
+  draw_crew(c->x, c->y, c->yaw, 0, c->skin, c->ph, c->run);
+  char_lit = 1.f;
   if (proj(c->x, 1.65f, c->y, &x, &y, &z))
     text(x - strlen(nm_of(i)) * 2, y - 10, 1, i ? C(255,210,58) : C(255,255,255), nm_of(i));
 }
 
 #define MAXI 1600
 enum { IT_FACE, IT_BODY, IT_CHAR, IT_TASK };
-static float keyz[MAXI], ipos[MAXI][8];
+static float keyz[MAXI], ipos[MAXI][8], ifk[MAXI];
 static u16 ord[MAXI], iidx[MAXI];
 static u8 ityp[MAXI];
 static int cmp_far_first(const void *a, const void *b) {
@@ -828,14 +964,16 @@ static void draw_world(float tx, float tz, float cull, int chars) {
   /* 1) pisos: nunca se solapan entre si, van primero */
   for (int t = 0; t < SK_NTILE; t++) {
     const SkTile *T = &SK_TILE[t];
-    if (fabsf((T->x0 + T->x1) * .5f - tx) > cull || fabsf((T->z0 + T->z1) * .5f - tz) > cull) continue;
+    float tcx = (T->x0 + T->x1) * .5f, tcz = (T->z0 + T->z1) * .5f, tk = 1.f;
+    if (fabsf(tcx - tx) > cull || fabsf(tcz - tz) > cull) continue;
+    if (fog_on) { if (hypotf(tcx - fogx, tcz - fogz) > VIS_R + .8f || !vis_near(tcx, tcz)) continue; tk = fogk(tcx, tcz); }
     int ok = proj(T->x0, 0, T->z0, &sx[0], &sy[0], &zc[0]) & proj(T->x1, 0, T->z0, &sx[1], &sy[1], &zc[1]) &
              proj(T->x0, 0, T->z1, &sx[2], &sy[2], &zc[2]) & proj(T->x1, 0, T->z1, &sx[3], &sy[3], &zc[3]);
     if (!ok) continue;
     float mnx = sx[0], mxx = sx[0], mny = sy[0], mxy = sy[0];
     for (int k = 1; k < 4; k++) { if (sx[k] < mnx) mnx = sx[k]; if (sx[k] > mxx) mxx = sx[k]; if (sy[k] < mny) mny = sy[k]; if (sy[k] > mxy) mxy = sy[k]; }
     if (mxx < -200 || mnx > SW + 200 || mxy < -200 || mny > SH + 200 || mxx - mnx > 2500 || mxy - mny > 2500) continue;
-    gsKit_prim_quad(gs, sx[0], sy[0], sx[1], sy[1], sx[2], sy[2], sx[3], sy[3], 1, C(T->r, T->g, T->b));
+    gsKit_prim_quad(gs, sx[0], sy[0], sx[1], sy[1], sx[2], sy[2], sx[3], sy[3], 1, C((int)(T->r * tk), (int)(T->g * tk), (int)(T->b * tk)));
   }
   /* 2) lista de objetos a ordenar */
   int n = 0;
@@ -853,6 +991,8 @@ static void draw_world(float tx, float tz, float cull, int chars) {
       if (sx[k] < mnx) mnx = sx[k]; if (sx[k] > mxx) mxx = sx[k]; if (sy[k] < mny) mny = sy[k]; if (sy[k] > mxy) mxy = sy[k];
     }
     if (!ok || mxx < -200 || mnx > SW + 200 || mxy < -200 || mny > SH + 200 || mxx - mnx > 2500 || mxy - mny > 2500) continue;
+    if (fog_on && (hypotf(cx - fogx, cz - fogz) > VIS_R + 1.2f || !vis_near(cx, cz))) continue;   /* fuera de tu vision */
+    ifk[n] = fogk(cx, cz);
     for (int k = 0; k < 4; k++) { ipos[n][k * 2] = sx[k]; ipos[n][k * 2 + 1] = sy[k]; }
     float dd = (cx - vc[0]) * vf[0] + (cy - vc[1]) * vf[1] + (cz - vc[2]) * vf[2];
     keyz[n] = dd; ityp[n] = IT_FACE; iidx[n] = f; n++;
@@ -860,11 +1000,11 @@ static void draw_world(float tx, float tz, float cull, int chars) {
   if (chars) {
     float x, y, z;
     for (int i = 0; i < nb && n < MAXI; i++)
-      if (proj(bodies[i].x, .3f, bodies[i].y, &x, &y, &z)) { keyz[n] = z; ityp[n] = IT_BODY; iidx[n] = i; n++; }
+      if (vis_at(bodies[i].x, bodies[i].y) && proj(bodies[i].x, .3f, bodies[i].y, &x, &y, &z)) { keyz[n] = z; ityp[n] = IT_BODY; iidx[n] = i; n++; }
     for (int i = 1; i < 6 && n < MAXI; i++)      /* el jugador (0) se dibuja al final: siempre visible */
-      if (ch[i].alive && proj(ch[i].x, .5f, ch[i].y, &x, &y, &z)) { keyz[n] = z; ityp[n] = IT_CHAR; iidx[n] = i; n++; }
-    for (int k = 0; k < 3 && n < MAXI; k++)
-      if (proj(SK_STN[ch[0].tn[k]][0], 1.3f, SK_STN[ch[0].tn[k]][1], &x, &y, &z)) { keyz[n] = z; ityp[n] = IT_TASK; iidx[n] = k; n++; }
+      if (ch[i].alive && vis_at(ch[i].x, ch[i].y) && proj(ch[i].x, .5f, ch[i].y, &x, &y, &z)) { keyz[n] = z; ityp[n] = IT_CHAR; iidx[n] = i; n++; }
+    for (int k = 0; k < 3 && n < MAXI && !ch[0].imp; k++)
+      if (vis_at(SK_STN[ch[0].tn[k]][0], SK_STN[ch[0].tn[k]][1]) && proj(SK_STN[ch[0].tn[k]][0], 1.3f, SK_STN[ch[0].tn[k]][1], &x, &y, &z)) { keyz[n] = z; ityp[n] = IT_TASK; iidx[n] = k; n++; }
   }
   for (int i = 0; i < n; i++) ord[i] = i;
   qsort(ord, n, sizeof(u16), cmp_far_first);
@@ -874,11 +1014,12 @@ static void draw_world(float tx, float tz, float cull, int chars) {
     switch (ityp[i]) {
     case IT_FACE: {
       const SkFace *F = &SK_FACE[iidx[i]]; const float *q = ipos[i];
-      gsKit_prim_quad(gs, q[0], q[1], q[2], q[3], q[6], q[7], q[4], q[5], 1, C(F->r, F->g, F->b));
+      float fk = ifk[i];
+      gsKit_prim_quad(gs, q[0], q[1], q[2], q[3], q[6], q[7], q[4], q[5], 1, C((int)(F->r * fk), (int)(F->g * fk), (int)(F->b * fk)));
       break; }
     case IT_BODY: {
       Body *b = &bodies[iidx[i]]; float x, y;
-      if (on_screen(b->x, b->y, &x, &y)) draw_crew(b->x, b->y, b->yaw, 1, ch[b->i].skin);
+      if (on_screen(b->x, b->y, &x, &y)) { char_lit = fogk(b->x, b->y); draw_crew(b->x, b->y, b->yaw, 1, ch[b->i].skin, 0, 0); char_lit = 1.f; }
       break; }
     case IT_CHAR: draw_char(iidx[i]); break;
     case IT_TASK: {
@@ -898,29 +1039,72 @@ static void ctext(float y, int sc, u64 col, const char *t) {      /* texto centr
   text((SW - (int)strlen(t) * 4 * sc + sc) / 2, y, sc, col, t);
 }
 
+/* ---------- animacion de entrada: tu rol (y solo el tuyo) ----------
+   Tripulante: se ve a los 6 en fila (nadie queda "omitido", asi no se delata al impostor).
+   Impostor: apareces tu solo. En ningun caso se muestra el rol de los demas. */
+#define INTRO_LEN 5.4f
+static float ease3(float u) { u = clamp01(u); return 1.f - (1.f - u) * (1.f - u) * (1.f - u); }
+static void draw_intro(void) {
+  int imp = ch[0].imp; float t = intro_t;
+  rect(0, 0, SW, SH, imp ? C(24,3,8) : C(3,8,30));
+  for (int i = 0; i < 70; i++) {                                         /* estrellas que van cayendo */
+    int x = (i * 97 + 31) % SW, y = (int)(i * 53 + t * (14 + (i % 5) * 9)) % SH;
+    rect(x, y, x + 2, y + 2, i % 7 ? C(90,100,140) : C(200,210,255));
+  }
+  rect(0, 20, SW, 126, imp ? C(70,6,14) : C(8,28,70));                   /* banda del titulo */
+  set_view(0, .95f, 0, 0, .15f, 7.5f);
+  static const int slot_of[6] = {2, 0, 1, 3, 4, 5};                      /* personaje -> lugar en la fila (tu, al centro-izquierda) */
+  static const int order[6] = {0, 5, 1, 4, 2, 3};                         /* lugares de atras hacia adelante */
+  int slot_char[6]; for (int c = 0; c < 6; c++) slot_char[slot_of[c]] = c;
+  for (int oi = 0; oi < 6; oi++) {
+    int slot = order[oi], who = slot_char[slot];
+    if (imp && who != 0) continue;
+    float xt = imp ? 0.f : (slot - 2.5f) * 1.45f, zt = imp ? .6f : -fabsf(slot - 2.5f) * .3f;
+    float t0 = .25f + (imp ? 0.f : slot * .13f), u = (t - t0) / 1.3f;
+    if (t < t0) continue;                                                /* aun no entra */
+    float z = zt - 13.f * (1.f - ease3(u)), ph = 0, run = 0;
+    if (u < 1.f) { run = 1.f; ph = (t - t0) * STEP_RATE * 3.14159f; }   /* entra corriendo */
+    draw_crew(xt, z, 3.14159f, 0, ch[who].skin, ph, run);
+    if (who == 0) { float x, y, zc; if (proj(xt, 1.95f, z, &x, &y, &zc)) text(x - 4, y - 8, 1, C(255,255,255), "TU"); }
+  }
+  if (t > .5f) {
+    float e1 = ease3((t - .5f) / .45f);
+    ctext(28.f - (1.f - e1) * 90.f, 7, imp ? C(255,60,70) : C(108,225,255), imp ? "IMPOSTOR" : "TRIPULANTE");
+  }
+  if (t > 1.1f) ctext(96, 3, C(235,240,255), imp ? "ELIMINA A LA TRIPULACION" : "HAY 1 IMPOSTOR ENTRE NOSOTROS");
+  if (t > 1.0f && t < INTRO_LEN - .5f && (((int)(t * 2)) & 1)) ctext(410, 2, C(160,190,255), "START PARA SALTAR");
+  float k = t < .5f ? t / .5f : (t > INTRO_LEN - .45f ? (INTRO_LEN - t) / .45f : 1.f); k = clamp01(k);   /* cortina */
+  float hh = (1.f - k) * SH * .5f;
+  if (hh > 0) { rect(0, 0, SW, hh, C(0,0,0)); rect(0, SH - hh, SW, SH, C(0,0,0)); }
+}
+
 static void draw(void) {
   gsKit_clear(gs, C(2,6,23));
+  if (state == INTRO) { draw_intro(); return; }
   if (state == TITLE) {
+    fog_on = 0;
     u64 bg = C(2,6,23), yel = C(255,210,58), wht = C(230,240,255);
     set_view(0, 0, 0, gt * .25f, .8f, 70.f);                 /* camara orbitando el mapa */
     draw_world(0, 0, 80.f, 0);
     const u8 *sk = CM_SKIN_RGB[pskin];
     if (tmenu == 0) {                                         /* ---- menu principal ---- */
-      static const char *opt[3] = {"SKIN", "JUGAR", "CONTROLES"};
+      static const char *opt[4] = {"SKIN", "", "JUGAR", "CONTROLES"};
+      static const char *rn[3] = {"AL AZAR", "TRIPULANTE", "IMPOSTOR"};
       rect(100, 30, SW - 100, 112, bg); ctext(52, 8, C(150,190,255), "SOSPECHOSO");
       rect(150, 118, SW - 150, 148, bg); ctext(125, 3, wht, "ESTILO PS2 - HOMEBREW");
-      for (int i = 0; i < 3; i++) {
-        float y = 176 + i * 52;
-        rect(170, y, SW - 170, y + 42, i == topt ? yel : C(40,70,170));
-        ctext(y + 14, 3, i == topt ? C(30,20,0) : C(255,255,255), opt[i]);
+      for (int i = 0; i < 4; i++) {
+        float y = 164 + i * 48; char b[40]; const char *lb = opt[i];
+        if (i == 1) { snprintf(b, sizeof b, "ROL: %s", rn[prole]); lb = b; }
+        rect(170, y, SW - 170, y + 40, i == topt ? yel : C(40,70,170));
+        ctext(y + 13, 3, i == topt ? C(30,20,0) : C(255,255,255), lb);
       }
-      rect(SW - 170 - 44, 176 + 8, SW - 170 - 12, 176 + 34, C(sk[0], sk[1], sk[2]));   /* muestra de tu skin */
+      rect(SW - 170 - 44, 164 + 7, SW - 170 - 12, 164 + 33, C(sk[0], sk[1], sk[2]));   /* muestra de tu skin */
       rect(40, 402, SW - 40, 428, bg); ctext(408, 2, C(160,190,255), "ARRIBA-ABAJO ELEGIR  X ACEPTAR  START JUGAR");
     } else if (tmenu == 1) {                                  /* ---- skin ---- */
       rect(100, 24, SW - 100, 88, bg); ctext(40, 5, C(150,190,255), "ELIGE TU SKIN");
       rect(190, 96, SW - 190, 300, bg);
       set_view(0, .65f, 0, 0, .2f, 6.5f);
-      draw_crew(0, 0, gt * 1.2f, 0, pskin);
+      draw_crew(0, 0, gt * 1.2f, 0, pskin, gt * STEP_RATE * 3.14159f, 1.f);   /* en el menu de skin corre en el lugar */
       { char b[40]; snprintf(b, sizeof b, "< %s >", CM_SKIN_NAME[pskin]);
         rect(170, 306, SW - 170, 340, bg); ctext(314, 3, wht, b); }
       { float x0 = (SW - CM_NSKIN * 40 + 12) / 2.f;
@@ -931,9 +1115,9 @@ static void draw(void) {
         } }
       rect(40, 402, SW - 40, 428, bg); ctext(408, 2, C(160,190,255), "IZQ-DER CAMBIAR  X ACEPTAR");
     } else {                                                  /* ---- controles ---- */
-      static const char *ln[5] = {"D-PAD O STICK  MOVER", "X  USAR TAREA O VOTAR", "O  REPORTAR CUERPO", "O  SALIR DE UNA TAREA", "START  JUGAR"};
+      static const char *ln[6] = {"D-PAD O STICK  MOVER", "X  USAR TAREA O VOTAR", "X  MATAR (SI ERES IMPOSTOR)", "O  REPORTAR CUERPO", "O  SALIR DE UNA TAREA", "START  JUGAR"};
       rect(90, 40, SW - 90, 390, bg); ctext(56, 5, C(150,190,255), "CONTROLES");
-      for (int i = 0; i < 5; i++) text(130, 140 + i * 40, 2, i % 2 ? wht : C(190,215,255), ln[i]);
+      for (int i = 0; i < 6; i++) text(110, 130 + i * 38, 2, i % 2 ? wht : C(190,215,255), ln[i]);
       rect(40, 402, SW - 40, 428, bg); ctext(408, 2, C(160,190,255), "X VOLVER");
     }
     return;
@@ -941,7 +1125,8 @@ static void draw(void) {
   Ch *p = &ch[0];
   camx += (p->x - camx) * (DT * 8 > 1 ? 1 : DT * 8); camz += (p->y - camz) * (DT * 8 > 1 ? 1 : DT * 8);
   set_view(camx, .8f, camz, 0, 1.1f, 14.5f);                  /* ~63 grados, siguiendo al jugador */
-  draw_world(camx, camz, 26.f, 1);
+  fog_on = 1; vis_update(p->x, p->y);                         /* niebla: solo lo que tienes a la vista */
+  draw_world(camx, camz, VIS_R + 3.5f, 1);
 
   float sx, sy, sz;
   if (nearTask >= 0 && proj(p->x, 1.65f, p->y, &sx, &sy, &sz)) {
@@ -949,10 +1134,16 @@ static void draw(void) {
     text(sx - 16, sy - 30, 1, C(255,255,255), "X = USAR");
   }
   if (nearBody >= 0 && state == PLAY) text(240, SH - 30, 2, C(255,90,110), "O = REPORTAR");
+  if (nearKill >= 0 && cd <= 0 && state == PLAY) text(250, SH - 54, 2, C(255,70,80), "X = MATAR");
 
   /* HUD: barra de progreso y tareas */
   rect(10, 10, 10 + 300, 24, C(91,151,255)); rect(12, 12, 12 + 296.0f * done / total, 22, C(109,255,176));
-  for (int k = 0; k < 3; k++) { char b[48]; snprintf(b, sizeof b, "%s %s", p->td[k] ? "OK" : "--", TN[p->tn[k]]); text(10, 32 + k * 12, 1, p->td[k] ? C(109,255,176) : C(220,235,255), b); }
+  if (p->imp) {
+    char b[40];
+    text(10, 32, 1, C(255,70,80), "ERES EL IMPOSTOR");
+    if (cd > 0) snprintf(b, sizeof b, "MATAR EN %d", (int)ceilf(cd)); else snprintf(b, sizeof b, "X = MATAR");
+    text(10, 44, 1, cd > 0 ? C(220,235,255) : C(255,210,58), b);
+  } else for (int k = 0; k < 3; k++) { char b[48]; snprintf(b, sizeof b, "%s %s", p->td[k] ? "OK" : "--", TN[p->tn[k]]); text(10, 32 + k * 12, 1, p->td[k] ? C(109,255,176) : C(220,235,255), b); }
   { int r = room_of(p->x, p->y); const char *nm = r >= 0 ? NM[r] : "PASILLO"; text(SW - 10 - strlen(nm) * 4 * 2, SH - 24, 2, C(150,190,255), nm); }
 
   /* minimapa (esquina superior derecha, 2 px por metro) */
@@ -960,11 +1151,11 @@ static void draw(void) {
     rect(mx0 - 3, my0 - 3, mx0 + 156, my0 + 80, C(91,151,255)); rect(mx0 - 1, my0 - 1, mx0 + 154, my0 + 78, C(4,10,40));
     for (int i = 0; i < SK_NFLOOR; i++)
       rect(mx0 + (SK_FL[i][0] - ox) * sc, my0 + (SK_FL[i][1] - oz) * sc, mx0 + (SK_FL[i][2] - ox) * sc, my0 + (SK_FL[i][3] - oz) * sc, C(40,70,150));
-    for (int k = 0; k < 3; k++) if (!p->td[k]) {
+    for (int k = 0; k < 3 && !p->imp; k++) if (!p->td[k]) {
       float x = mx0 + (SK_STN[p->tn[k]][0] - ox) * sc, y = my0 + (SK_STN[p->tn[k]][1] - oz) * sc;
       rect(x - 2, y - 2, x + 2, y + 2, C(255,210,58));
     }
-    for (int i = 0; i < nb; i++) { float x = mx0 + (bodies[i].x - ox) * sc, y = my0 + (bodies[i].y - oz) * sc; rect(x - 2, y - 2, x + 2, y + 2, C(255,60,80)); }
+    for (int i = 0; i < nb; i++) { if (!vis_at(bodies[i].x, bodies[i].y)) continue; float x = mx0 + (bodies[i].x - ox) * sc, y = my0 + (bodies[i].y - oz) * sc; rect(x - 2, y - 2, x + 2, y + 2, C(255,60,80)); }
     { float x = mx0 + (p->x - ox) * sc, y = my0 + (p->y - oz) * sc; rect(x - 2, y - 2, x + 3, y + 3, C(255,255,255)); } }
 
   if (mini >= 0 && state == PLAY) mini_draw();
@@ -1004,6 +1195,8 @@ int main(void) {
   SW = gs->Width; SH = gs->Height;
 
   nav_init();
+  vis_init();
+  audio_init();
   padInit(0); padPortOpen(0, 0, padBuf);
   while (padGetState(0, 0) != PAD_STATE_STABLE) {}
   padSetMainMode(0, 0, PAD_MMODE_DUALSHOCK, PAD_MMODE_LOCK);
@@ -1015,14 +1208,21 @@ int main(void) {
         gt += DT;
         if (pressed & PAD_START) { tmenu = 0; start(); break; }
         if (tmenu == 0) {
-          if (mpress & PAD_UP) topt = (topt + 2) % 3;
-          if (mpress & PAD_DOWN) topt = (topt + 1) % 3;
-          if (mpress & PAD_CROSS) { if (topt == 0) tmenu = 1; else if (topt == 1) start(); else tmenu = 2; }
+          if (mpress & PAD_UP) topt = (topt + 3) % 4;
+          if (mpress & PAD_DOWN) topt = (topt + 1) % 4;
+          if (topt == 1 && (mpress & PAD_RIGHT)) prole = (prole + 1) % 3;
+          if (topt == 1 && (mpress & PAD_LEFT)) prole = (prole + 2) % 3;
+          if (mpress & PAD_CROSS) { if (topt == 0) tmenu = 1; else if (topt == 1) prole = (prole + 1) % 3; else if (topt == 2) start(); else tmenu = 2; }
         } else if (tmenu == 1) {
           if (mpress & PAD_RIGHT) pskin = (pskin + 1) % CM_NSKIN;
           if (mpress & PAD_LEFT) pskin = (pskin + CM_NSKIN - 1) % CM_NSKIN;
           if (mpress & (PAD_CROSS | PAD_CIRCLE)) tmenu = 0;
         } else if (mpress & (PAD_CROSS | PAD_CIRCLE)) tmenu = 0;
+        break;
+      case INTRO:
+        intro_t += DT;
+        if (intro_t > 1.0f && intro_t < INTRO_LEN - .45f && (pressed & (PAD_START | PAD_CROSS))) intro_t = INTRO_LEN - .45f;   /* saltar */
+        if (intro_t >= INTRO_LEN) { state = PLAY; camx = ch[0].x; camz = ch[0].y; }
         break;
       case PLAY: update(); break;
       case MEET:
