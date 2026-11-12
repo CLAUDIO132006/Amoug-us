@@ -20,7 +20,7 @@ PROTOCOLO (binario, little-endian). Cada mensaje:  [tipo u8][largo u8][carga: la
     0x06 START                                -> 0x84 START (solo el anfitrion)
     0x07 PING                                 -> 0x8D PONG
     0x10 POS     [x s16 cm][z s16 cm][yaw s16 mrad][flags u8]
-    0x11 KILL    [victima u8][x s16][z s16]
+    0x11 KILL    [victima u8][x s16][z s16][animacion u8, opcional]
     0x12 REPORT  [victima u8]
     0x13 TASK
     0x14 VOTE    [objetivo u8]  (255 = saltar)
@@ -34,7 +34,7 @@ PROTOCOLO (binario, little-endian). Cada mensaje:  [tipo u8][largo u8][carga: la
     0x8E ERROR   [codigo]  1 sala llena, 2 no existe, 3 ya en juego, 4 no eres anfitrion,
                            5 faltan jugadores, 6 estado invalido
     0x90 POS     [slot][x s16][z s16][yaw s16][flags u8]
-    0x91 BODY    [asesino][victima][x s16][z s16]
+    0x91 BODY    [asesino][victima][x s16][z s16][animacion u8]
     0x92 MEETING [reporta][victima][mascara_vivos]
     0x93 RESULT  [expulsado (255 = nadie)][era_impostor][mascara_vivos]
     0x94 TASKS   [hechas][totales]
@@ -42,7 +42,7 @@ PROTOCOLO (binario, little-endian). Cada mensaje:  [tipo u8][largo u8][carga: la
                  motivo: 0 tareas, 1 impostor expulsado, 2 impostor gana (queda 1 tripulante), 3 el impostor se fue
     0x96 LEFT    [slot]
 """
-import argparse, asyncio, random, struct, time
+import argparse, asyncio, random, struct, time, traceback
 
 VERSION = 1
 MAX_PLAYERS = 6
@@ -155,6 +155,8 @@ class Server:
                 room.host = min(room.players)             # el siguiente jugador pasa a ser anfitrion
             room.send_lobby()
         else:
+            if room.host == slot:
+                room.host = min(room.players)
             room.alive.discard(slot)
             room.bodies.discard(slot)
             room.broadcast(S_LEFT, bytes([slot]))
@@ -242,8 +244,11 @@ class Server:
             pl.send(S_PONG)
         elif t == C_LIST:
             rs = sorted(self.rooms.values(), key=lambda r: r.id)[:40]
+            def host_skin(r):                                      # el anfitrion pudo irse en plena partida
+                p = r.players.get(r.host) or next(iter(r.players.values()), None)
+                return p.skin if p else 0
             body = bytes([len(rs)]) + b"".join(
-                bytes([r.id, len(r.players), MAX_PLAYERS, 0 if r.state == "lobby" else 1, r.players[r.host].skin]) for r in rs)
+                bytes([r.id, len(r.players), MAX_PLAYERS, 0 if r.state == "lobby" else 1, host_skin(r)]) for r in rs)
             pl.send(S_ROOMS, body)
         elif t == C_CREATE and room is None:
             rid = self.new_room_id()
@@ -290,7 +295,8 @@ class Server:
                 room.last_kill = now
                 room.alive.discard(victim)
                 room.bodies.add(victim)
-                room.broadcast(S_BODY, bytes([pl.slot, victim]) + data[1:5])
+                anim = data[5] if len(data) >= 6 else 0                 # numero de animacion de muerte (opcional, clientes viejos no lo mandan)
+                room.broadcast(S_BODY, bytes([pl.slot, victim]) + data[1:5] + bytes([anim]))
                 self.check_win(room)
         elif t == C_REPORT and len(data) >= 1:
             victim = data[0]
@@ -327,7 +333,10 @@ class Server:
                 while len(buf) >= 2 and len(buf) >= 2 + buf[1]:
                     t, n = buf[0], buf[1]
                     data, buf = buf[2:2 + n], buf[2 + n:]
-                    self.handle(pl, t, data)
+                    try:
+                        self.handle(pl, t, data)
+                    except Exception:
+                        traceback.print_exc()                       # se registra y la conexion sigue viva
                 if len(buf) > 600:
                     break
         except (ConnectionError, asyncio.IncompleteReadError):
@@ -342,13 +351,16 @@ class Server:
         while True:
             await asyncio.sleep(0.5)
             now = time.monotonic()
-            for room in list(self.rooms.values()):
-                if room.meeting is not None and now >= room.meeting["deadline"]:
-                    self.try_resolve(room)
-            for pl in list(self.players.values()):
-                if now - pl.last > IDLE_TIMEOUT:
-                    print("[!] sin actividad, se cierra", pl.pid)
-                    pl.writer.close()
+            try:
+                for room in list(self.rooms.values()):
+                    if room.meeting is not None and now >= room.meeting["deadline"]:
+                        self.try_resolve(room)
+                for pl in list(self.players.values()):
+                    if now - pl.last > IDLE_TIMEOUT:
+                        print("[!] sin actividad, se cierra", pl.pid)
+                        pl.writer.close()
+            except Exception:
+                traceback.print_exc()                               # el temporizador nunca debe morir
 
 
 async def serve(port, min_players, host="0.0.0.0"):
