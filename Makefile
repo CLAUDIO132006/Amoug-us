@@ -14,6 +14,14 @@ IRX   = $(PS2SDK)/iop/irx
 AUDIO  ?= 1
 ONLINE ?= 1
 
+# Si falta sfx_step.h (el archivo del sonido) NO se rompe la compilacion: se compila sin audio y avisa en el log.
+ifeq ($(AUDIO),1)
+ifeq ($(wildcard sfx_step.h),)
+$(warning [sospechoso] FALTA sfx_step.h en el repositorio: se compila SIN sonido. Subelo junto a main.c para tener audio.)
+override AUDIO := 0
+endif
+endif
+
 # ---- sonido de pasos (audsrv) ----
 # "override" hace que estas opciones NO se pierdan aunque tu CI/terminal pase su propio EE_CFLAGS o EE_LIBS.
 ifeq ($(AUDIO),1)
